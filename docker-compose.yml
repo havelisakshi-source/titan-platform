@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: titan
+      POSTGRES_USER: titan
+      POSTGRES_PASSWORD: titan123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  api:
+    image: python:3.11-slim
+    working_dir: /app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app
+    command: bash -c "pip install fastapi uvicorn && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
