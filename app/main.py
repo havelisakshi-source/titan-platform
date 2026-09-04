@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-🚀 TITAN PRO – Intraday Edition
-- Real-time prices from NSE (fallback to simulated)
-- Intraday price history (last 60 points)
+🚀 TITAN PRO – Multi‑Source Intraday with IST Timezone
+- Real-time: NSE → Yahoo Finance → Simulated
 - Sparkline charts on every card
-- Advanced indicators (RSI, MACD, Bollinger Bands)
+- Data source indicator
 - Paper trading, Telegram alerts
 - Full animated dashboard
+- Timezone: Asia/Kolkata (IST)
 """
+
+import os
+import time
+# Force timezone to IST (India Standard Time)
+os.environ['TZ'] = 'Asia/Kolkata'
+time.tzset()
 
 import asyncio
 import json
 import random
-import os
 import math
+import logging
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import warnings
 warnings.filterwarnings('ignore')
@@ -26,14 +32,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 import uvicorn
 
-# --- NSE (only real data source) ---
+# --- NSE ---
 try:
     from nsetools import Nse
     nse = Nse()
     HAS_NSE = True
 except:
     HAS_NSE = False
-    print("⚠️ nsetools not installed. Install: pip install nsetools")
+    logging.warning("⚠️ nsetools not installed. Install: pip install nsetools")
+
+# --- Yahoo Finance ---
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except:
+    HAS_YFINANCE = False
+    logging.warning("⚠️ yfinance not installed. Install: pip install yfinance")
 
 # --- Telegram ---
 try:
@@ -41,15 +55,18 @@ try:
     HAS_REQUESTS = True
 except:
     HAS_REQUESTS = False
-    print("⚠️ requests not installed. Telegram alerts won't work.")
+    logging.warning("⚠️ requests not installed. Telegram alerts won't work.")
 
-# --- Indicators (TA-Lib optional, fallback included) ---
+# --- TA-Lib (optional) ---
 try:
     import talib
     HAS_TALIB = True
 except:
     HAS_TALIB = False
-    print("⚠️ TA-Lib not installed. Using fallback indicators.")
+    logging.warning("⚠️ TA-Lib not installed. Using fallback indicators.")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 # ============================================
 # CONFIGURATION
@@ -88,34 +105,50 @@ BASE_PRICES = {
 }
 
 # ============================================
-# INTRADAY PRICE SIMULATION
+# MULTI-SOURCE DATA FETCHER
 # ============================================
-def generate_intraday_prices(base_price, num_points=60):
-    """Generate simulated intraday price movement."""
-    prices = []
-    current = base_price
-    for _ in range(num_points):
-        change = random.uniform(-0.005, 0.005)  # 0.5% max change per step
-        current = max(1, current * (1 + change))
-        prices.append(round(current, 2))
-    return prices
-
-# ============================================
-# REAL DATA FETCHER (NSE Only)
-# ============================================
-def get_real_price(symbol):
-    """Get real price from NSE, returns None if fails"""
+def get_price_from_nse(symbol):
     if HAS_NSE:
         try:
             quote = nse.get_quote(symbol)
             if quote and 'lastPrice' in quote:
-                return round(quote['lastPrice'], 2)
-        except:
-            pass
-    return None
+                return round(quote['lastPrice'], 2), "NSE"
+        except Exception as e:
+            logging.debug(f"NSE error for {symbol}: {e}")
+    return None, None
+
+def get_price_from_yahoo(symbol):
+    if HAS_YFINANCE:
+        try:
+            ticker = yf.Ticker(symbol + ".NS")
+            data = ticker.history(period="1d", interval="1m")
+            if not data.empty:
+                price = round(data['Close'].iloc[-1], 2)
+                return price, "Yahoo"
+        except Exception as e:
+            logging.debug(f"Yahoo error for {symbol}: {e}")
+    return None, None
+
+def get_price_fallback(symbol):
+    base = BASE_PRICES.get(symbol, 1000)
+    seed = hash(symbol) % 1000
+    random.seed(seed + int(datetime.now().timestamp() / 60))
+    change = random.uniform(-0.02, 0.02)
+    random.seed()
+    price = base * (1 + change)
+    return round(price, 2), "Simulated"
+
+def get_real_price(symbol):
+    price, source = get_price_from_nse(symbol)
+    if price:
+        return price, source
+    price, source = get_price_from_yahoo(symbol)
+    if price:
+        return price, source
+    price, source = get_price_fallback(symbol)
+    return price, source
 
 def get_historical_data_simulated(symbol):
-    """Generate simulated historical prices for indicators"""
     base = BASE_PRICES.get(symbol, 1000)
     prices = []
     current = base
@@ -126,7 +159,7 @@ def get_historical_data_simulated(symbol):
     return prices
 
 # ============================================
-# FALLBACK INDICATORS (if TA-Lib not available)
+# FALLBACK INDICATORS
 # ============================================
 def fallback_rsi(prices, period=14):
     if len(prices) < period:
@@ -262,25 +295,25 @@ class AIEngine:
         self.results = []
         self.use_real_data = True
         self.last_prices = {}
-        self.intraday = {}  # symbol -> list of (timestamp, price)
+        self.intraday = {}
         self.paper_trader = PaperTrader()
-        self.intraday_limit = 60  # keep last 60 points
+        self.intraday_limit = 60
+        self.data_sources = {}  # symbol -> source
 
     def update_intraday(self, symbol, price):
-        """Add new price point to intraday history"""
         now = datetime.now().isoformat()
         if symbol not in self.intraday:
             self.intraday[symbol] = []
         self.intraday[symbol].append((now, price))
-        # Keep only the last N points
         if len(self.intraday[symbol]) > self.intraday_limit:
             self.intraday[symbol] = self.intraday[symbol][-self.intraday_limit:]
 
     def get_price(self, symbol):
         if self.use_real_data:
-            price = get_real_price(symbol)
+            price, source = get_real_price(symbol)
             if price:
                 self.last_prices[symbol] = price
+                self.data_sources[symbol] = source
                 self.update_intraday(symbol, price)
                 return price
         # fallback to simulation
@@ -289,19 +322,26 @@ class AIEngine:
         change = random.uniform(-1.5, 1.5)
         new_price = max(1, old + change)
         self.last_prices[symbol] = new_price
+        self.data_sources[symbol] = "Simulated"
         self.update_intraday(symbol, new_price)
         return round(new_price, 2)
 
     def get_intraday_prices(self, symbol):
-        """Return list of prices (last N points) for a symbol"""
         if symbol in self.intraday:
             return [p[1] for p in self.intraday[symbol]]
-        # generate simulated intraday if missing
         base = BASE_PRICES.get(symbol, 1000)
-        return generate_intraday_prices(base, 30)
+        return self._generate_intraday(base, 30)
+
+    def _generate_intraday(self, base_price, num_points=60):
+        prices = []
+        current = base_price
+        for _ in range(num_points):
+            change = random.uniform(-0.005, 0.005)
+            current = max(1, current * (1 + change))
+            prices.append(round(current, 2))
+        return prices
 
     def get_historical_prices(self, symbol):
-        # Always use simulated for indicators (no real historical needed)
         return get_historical_data_simulated(symbol)
 
     def analyze(self, symbol, price):
@@ -351,7 +391,8 @@ class AIEngine:
             "target": target,
             "stop_loss": stop_loss,
             "indicators": indicators,
-            "intraday": self.get_intraday_prices(symbol),  # include last 30 prices for sparkline
+            "intraday": self.get_intraday_prices(symbol),
+            "data_source": self.data_sources.get(symbol, "Unknown"),
             "timestamp": datetime.now().isoformat()
         }
 
@@ -374,7 +415,7 @@ class AIEngine:
 # ============================================
 # FASTAPI APP
 # ============================================
-app = FastAPI(title="TITAN Pro - Intraday", version="3.1.0")
+app = FastAPI(title="TITAN Pro - Intraday", version="3.2.0")
 ai = AIEngine()
 
 app.add_middleware(
@@ -386,7 +427,7 @@ app.add_middleware(
 )
 
 # ============================================
-# HTML TEMPLATE (Animated Dashboard with Sparklines)
+# HTML TEMPLATE (same as before, with minor time improvement)
 # ============================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -396,6 +437,7 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🚀 TITAN Pro - Intraday</title>
     <style>
+        /* same styles as before */
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
             --bg: #0a0e17;
@@ -602,7 +644,7 @@ HTML_TEMPLATE = """
             height: 40px;
             width: 100%;
         }
-        .signal-card .chart-container svg {
+        .signal-card .chart-container canvas {
             width: 100%;
             height: 100%;
         }
@@ -634,7 +676,24 @@ HTML_TEMPLATE = """
             transition: width 1s ease;
             background: linear-gradient(90deg, #00c853, #ffab00, #ff1744);
         }
-        .signal-card .timestamp { font-size: 0.7rem; opacity: 0.5; margin-top: 10px; text-align: right; }
+        .signal-card .timestamp {
+            font-size: 0.7rem;
+            opacity: 0.5;
+            margin-top: 10px;
+            text-align: right;
+        }
+        .data-source-badge {
+            display: inline-block;
+            font-size: 0.6rem;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.1);
+            color: #aaa;
+            margin-left: 6px;
+        }
+        .source-real { background: #00c85333; color: #00c853; }
+        .source-fallback { background: #ffab0033; color: #ffab00; }
+        .source-simulated { background: #66666633; color: #888; }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         @keyframes fadeInDown { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
@@ -723,7 +782,6 @@ HTML_TEMPLATE = """
         }
         ctx.stroke();
 
-        // fill under curve
         ctx.lineTo(width - padding, height - padding);
         ctx.lineTo(padding, height - padding);
         ctx.closePath();
@@ -746,13 +804,31 @@ HTML_TEMPLATE = """
             const volume = s.indicators?.volume ? (s.indicators.volume/1e6).toFixed(1)+'M' : '--';
             const intraday = s.intraday || [];
             const canvasId = 'sparkline-' + s.symbol + '-' + idx;
+            const source = s.data_source || 'Unknown';
+            let sourceClass = 'source-simulated';
+            if (source === 'NSE') sourceClass = 'source-real';
+            else if (source === 'Yahoo') sourceClass = 'source-fallback';
+
+            // Format timestamp to local time (IST or user's local)
+            let timeDisplay = '';
+            if (s.timestamp) {
+                try {
+                    const d = new Date(s.timestamp);
+                    timeDisplay = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' });
+                } catch(e) {
+                    timeDisplay = s.timestamp;
+                }
+            }
 
             html += `
                 <div class="signal-card ${actionClass}" style="animation: fadeInUp 0.4s ease backwards; animation-delay: ${idx*0.05}s;">
                     <div class="glow"></div>
                     <div class="top-row">
                         <span class="symbol">${s.symbol}</span>
-                        <span class="action-badge ${actionClass}">${s.action}</span>
+                        <span>
+                            <span class="action-badge ${actionClass}">${s.action}</span>
+                            <span class="data-source-badge ${sourceClass}">${source}</span>
+                        </span>
                     </div>
                     <div class="price">₹${s.current_price.toFixed(2)}</div>
                     <div class="indicators">
@@ -770,13 +846,13 @@ HTML_TEMPLATE = """
                         <div><div class="label">Profit (₹1L)</div><div class="value" style="color:${profit>=0?'#00c853':'#ff1744'}">₹${profit.toFixed(2)}</div></div>
                     </div>
                     <div class="confidence-bar"><div class="fill" style="width:${s.confidence*100}%;background:linear-gradient(90deg, ${s.confidence>=0.7?'#00c853':s.confidence>=0.4?'#ffab00':'#ff1744'}, ${s.confidence>=0.7?'#00c853':s.confidence>=0.4?'#ffab00':'#ff1744'});"></div></div>
-                    <div class="timestamp">${s.timestamp ? new Date(s.timestamp).toLocaleTimeString() : ''}</div>
+                    <div class="timestamp">${timeDisplay}</div>
                 </div>
             `;
         });
         grid.innerHTML = html;
 
-        // Render sparklines after DOM update
+        // Render sparklines
         signals.forEach((s, idx) => {
             const canvasId = 'sparkline-' + s.symbol + '-' + idx;
             renderSparkline(canvasId, s.intraday || []);
@@ -789,7 +865,12 @@ HTML_TEMPLATE = """
         document.getElementById('sellCount').textContent = data.sell_signals ? data.sell_signals.length : 0;
         document.getElementById('holdCount').textContent = data.hold_signals ? data.hold_signals.length : 0;
         if (data.timestamp) {
-            document.getElementById('lastUpdate').textContent = new Date(data.timestamp).toLocaleTimeString();
+            try {
+                const d = new Date(data.timestamp);
+                document.getElementById('lastUpdate').textContent = d.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            } catch(e) {
+                document.getElementById('lastUpdate').textContent = data.timestamp;
+            }
         }
     }
 
@@ -865,7 +946,7 @@ HTML_TEMPLATE = """
 """
 
 # ============================================
-# API ENDPOINTS (including Intraday)
+# API ENDPOINTS
 # ============================================
 @app.get("/")
 async def root():
@@ -890,7 +971,6 @@ async def scan_nifty50(use_real: bool = True):
         else:
             s['expected_profit'] = 0
         s['capital_required'] = capital
-        # Ensure intraday is included (already in signal)
     return data
 
 @app.get("/api/screener/{symbol}")
@@ -913,11 +993,9 @@ async def scan_stock(symbol: str):
 
 @app.get("/api/intraday/{symbol}")
 async def get_intraday(symbol: str, points: int = 30):
-    """Return intraday price points for a symbol."""
     if symbol not in NIFTY_50:
         raise HTTPException(status_code=404, detail="Stock not found")
     prices = ai.get_intraday_prices(symbol)
-    # Return last 'points' entries
     if len(prices) > points:
         prices = prices[-points:]
     return {
@@ -995,5 +1073,5 @@ async def stream_events():
 # RUN
 # ============================================
 if __name__ == "__main__":
-    print("🚀 TITAN PRO (Intraday Edition) starting...")
+    print("🚀 TITAN PRO (IST Timezone) starting...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
